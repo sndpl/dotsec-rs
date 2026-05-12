@@ -18,7 +18,17 @@ pub async fn with_progress<T>(label: &str, fut: impl Future<Output = T>) -> T {
     let anim = chromakopia::animate::glow(chromakopia::presets::dark_n_stormy(), label, 1.0);
     let result = fut.await;
     if let Some(delay) = ANIMATION_DELAY.get() {
-        tokio::time::sleep(*delay).await;
+        let mut remaining = *delay;
+        let one_sec = Duration::from_secs(1);
+        while remaining >= one_sec {
+            anim.replace(&format!("{label} ({} sec)", remaining.as_secs()));
+            tokio::time::sleep(one_sec).await;
+            remaining -= one_sec;
+        }
+        if !remaining.is_zero() {
+            anim.replace(label);
+            tokio::time::sleep(remaining).await;
+        }
     }
     anim.fade_to_foreground(Duration::from_millis(400)).await;
     result
