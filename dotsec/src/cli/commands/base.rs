@@ -25,4 +25,11 @@ pub fn command() -> Command {
                 .required(false)
                 .env("DOTSEC_SCHEMA"),
         )
+        .arg(
+            arg!(--"animation-delay" <SECONDS> "Extra delay after each animation, in seconds (e.g. 1.5) — enjoy the show longer")
+                .global(true)
+                .required(false)
+                .env("DOTSEC_ANIMATION_DELAY")
+                .value_parser(clap::value_parser!(f64)),
+        )
 }

@@ -37,6 +37,12 @@ pub async fn parse_args() -> Result<(), Box<dyn Error>> {
     let command = create_command();
     let matches = command.get_matches();
 
+    if let Some(secs) = matches.get_one::<f64>("animation-delay").copied() {
+        if secs > 0.0 && secs.is_finite() {
+            helpers::set_animation_delay(Duration::from_secs_f64(secs));
+        }
+    }
+
     // No subcommand — show animated banner
     if matches.subcommand_name().is_none() {
         show_banner().await;

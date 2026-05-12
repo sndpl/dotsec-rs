@@ -1,13 +1,26 @@
 use colored::Colorize;
 use inquire::{Confirm, Select, Text};
 use std::future::Future;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+static ANIMATION_DELAY: OnceLock<Duration> = OnceLock::new();
+
+/// Set a cosmetic delay applied after each `with_progress` future resolves
+/// but before the fade-out, so users can savor the animation.
+pub fn set_animation_delay(delay: Duration) {
+    let _ = ANIMATION_DELAY.set(delay);
+}
 
 /// Run an async operation with a dark_n_stormy glow animation as progress indicator.
 /// When done, the label fades to the terminal's foreground color.
 pub async fn with_progress<T>(label: &str, fut: impl Future<Output = T>) -> T {
     let anim = chromakopia::animate::glow(chromakopia::presets::dark_n_stormy(), label, 1.0);
     let result = fut.await;
-    anim.fade_to_foreground(std::time::Duration::from_millis(400)).await;
+    if let Some(delay) = ANIMATION_DELAY.get() {
+        tokio::time::sleep(*delay).await;
+    }
+    anim.fade_to_foreground(Duration::from_millis(400)).await;
     result
 }
 
