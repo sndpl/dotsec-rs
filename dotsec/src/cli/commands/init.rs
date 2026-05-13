@@ -72,6 +72,29 @@ pub async fn match_args(
         }
     }
 
+    // Generate keypair for local provider
+    if config.provider.as_deref() == Some("local") {
+        let key_file = format!("{}.key", sec_file);
+        if std::path::Path::new(&key_file).exists() {
+            println!("{} {} already exists, reusing existing keypair", "✓".green(), key_file);
+        } else {
+            let (identity, _) = crypto::local::generate_keypair();
+            dotsec::write_sec_file(&key_file, &format!("{}\n", identity))?;
+            println!("{} Created {}", "✓".green(), key_file);
+
+            let gitignore_path = std::path::Path::new(sec_file)
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join(".gitignore");
+            let has_key_pattern = std::fs::read_to_string(&gitignore_path)
+                .map(|c| c.lines().any(|l| l.trim() == "*.key" || l.contains(".key")))
+                .unwrap_or(false);
+            if !has_key_pattern {
+                eprintln!("{} Add *.key to .gitignore to avoid committing private keys", "⚠".yellow().bold());
+            }
+        }
+    }
+
     let encrypt_all = helpers::resolve_encrypt_default(&config)?;
     let mut lines = dotsec::generate_header();
     lines.push(dotenv::Line::Newline);

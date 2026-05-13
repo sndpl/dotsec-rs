@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 aws = { path = "../aws" }
 base64 = { workspace = true }
+crypto = { path = "../crypto" }
 dotsec-core = { path = "../dotsec-core" }
 colored = { workspace = true }
 dotenv = { path = "../dotenv" }
@@ -33,10 +34,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { workspace = true }
 zeroize = "1.8"
-# Pinned to beta: chromakopia provides terminal gradient/glow animations for the
-# CLI banner and progress indicators (see cli/mod.rs and cli/helpers.rs). No
-# stable release is available yet; the exact pin avoids unexpected breakage.
-chromakopia = "=0.1.0-beta.2ad179b"
+chromakopia = "0.1.0"
 
 [features]
 default = ["cli"]

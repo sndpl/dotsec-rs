@@ -21,6 +21,11 @@
   --rp-home-feature-bg: #1a1a1a;
 }
 
+/* Hero action buttons — prevent text overflow on install command */
+.rp-button--big {
+  padding: 0 28px;
+}
+
 /* Version switcher banner */
 .version-banner {
   position: fixed;

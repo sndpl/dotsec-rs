@@ -1,16 +1,9 @@
-use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng, Payload},
-    AeadCore, Aes256Gcm,
-};
 use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use subtle::ConstantTimeEq;
 use thiserror::Error;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
-type HmacSha256 = Hmac<Sha256>;
+// Re-export shared crypto functions so existing callers (dotsec-core) don't break
+pub use crypto::{encrypt_value, decrypt_value, is_encrypted_value, pad, unpad, CryptoError};
 
 #[derive(Error, Debug)]
 pub enum DataStoreError {
@@ -28,6 +21,17 @@ pub enum DataStoreError {
     SsmError(String),
     #[error("Secrets Manager error: {0}")]
     SecretsManagerError(String),
+}
+
+impl From<CryptoError> for DataStoreError {
+    fn from(e: CryptoError) -> Self {
+        match e {
+            CryptoError::AesError(msg) => DataStoreError::AesError(msg),
+            CryptoError::DecodeError(e) => DataStoreError::DecodeError(e),
+            CryptoError::InvalidFormat => DataStoreError::InvalidFormat,
+            CryptoError::KeyCommitmentFailed => DataStoreError::KeyCommitmentFailed,
+        }
+    }
 }
 
 async fn create_kms_client(region: Option<&str>) -> aws_sdk_kms::Client {
@@ -72,7 +76,6 @@ pub async fn check_key_alias(
 }
 
 /// Create a new KMS key and associate an alias with it.
-/// Returns the key ARN.
 pub async fn create_key_with_alias(
     alias: &str,
     region: Option<&str>,
@@ -106,7 +109,6 @@ pub async fn create_key_with_alias(
 
 /// Generate a new AES-256 data encryption key via KMS.
 /// Returns (plaintext_dek, wrapped_dek) where wrapped_dek is KMS-encrypted.
-/// The plaintext DEK is wrapped in `Zeroizing` for automatic zeroization on drop.
 pub async fn generate_data_key(
     key_id: &str,
     region: Option<&str>,
@@ -136,7 +138,6 @@ pub async fn generate_data_key(
 }
 
 /// Unwrap a KMS-encrypted data key back to plaintext.
-/// The plaintext DEK is wrapped in `Zeroizing` for automatic zeroization on drop.
 pub async fn unwrap_data_key(
     wrapped_dek: &[u8],
     region: Option<&str>,
@@ -156,147 +157,6 @@ pub async fn unwrap_data_key(
         .to_vec();
 
     Ok(Zeroizing::new(plaintext))
-}
-
-/// Compute a 32-byte key commitment: HMAC-SHA256(key=DEK, msg="dotsec-key-commit").
-/// Stored alongside ciphertext to prove which key encrypted it.
-fn compute_key_commitment(dek: &[u8]) -> Vec<u8> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(dek).expect("HMAC accepts any key length");
-    mac.update(b"dotsec-key-commit");
-    mac.finalize().into_bytes().to_vec()
-}
-
-/// Verify key commitment matches the DEK (constant-time comparison).
-fn verify_key_commitment(dek: &[u8], commitment: &[u8]) -> Result<(), DataStoreError> {
-    let expected = compute_key_commitment(dek);
-    if expected.len() != commitment.len() || expected.ct_eq(commitment).unwrap_u8() != 1 {
-        return Err(DataStoreError::KeyCommitmentFailed);
-    }
-    Ok(())
-}
-
-/// Pad plaintext with random bytes so ciphertext length doesn't leak
-/// the original value length. Adds 0-1 extra 64-byte blocks randomly,
-/// so the same plaintext can land in different length buckets across
-/// re-encryptions.
-///
-/// Wire format: `[2-byte big-endian original length] [original data] [random padding to 64-byte boundary + 0-1 extra 64-byte blocks]`
-///
-/// Returns an error if data exceeds 65535 bytes (u16::MAX), since the
-/// length header is only 2 bytes.
-fn pad(data: &[u8]) -> Result<Vec<u8>, DataStoreError> {
-    use rand::RngCore;
-
-    if data.len() > u16::MAX as usize {
-        return Err(DataStoreError::AesError(format!(
-            "value too large to pad: {} bytes exceeds maximum of {} bytes",
-            data.len(),
-            u16::MAX
-        )));
-    }
-
-    let header_len = 2;
-    let total = header_len + data.len();
-    let base_padded = total.div_ceil(64) * 64;
-
-    // Add 0–1 extra 64-byte blocks randomly
-    let extra_blocks = (OsRng.next_u32() % 2) as usize;
-    let padded_len = base_padded + (extra_blocks * 64);
-
-    let mut buf = vec![0u8; padded_len];
-    OsRng.fill_bytes(&mut buf); // fill everything with random bytes first
-    let len = data.len() as u16;
-    buf[0..2].copy_from_slice(&len.to_be_bytes());
-    buf[2..2 + data.len()].copy_from_slice(data);
-    Ok(buf)
-}
-
-/// Remove padding and return the original plaintext bytes.
-fn unpad(data: &[u8]) -> Result<&[u8], DataStoreError> {
-    if data.len() < 2 {
-        return Err(DataStoreError::InvalidFormat);
-    }
-    let len = u16::from_be_bytes([data[0], data[1]]) as usize;
-    if 2 + len > data.len() {
-        return Err(DataStoreError::InvalidFormat);
-    }
-    Ok(&data[2..2 + len])
-}
-
-/// Encrypt a single value with AES-256-GCM using the given DEK.
-///
-/// The variable name is used as AAD (additional authenticated data),
-/// binding the ciphertext to its key name — prevents swapping encrypted
-/// values between variables.
-///
-/// Format: `ENC[base64(commitment || nonce || ciphertext || tag)]`
-/// - commitment: 32 bytes (HMAC-SHA256 key commitment)
-/// - nonce: 12 bytes
-/// - ciphertext + tag: variable length (padded plaintext + 16-byte GCM tag)
-pub fn encrypt_value(plaintext: &str, dek: &[u8], aad: &str) -> Result<String, DataStoreError> {
-    let cipher =
-        Aes256Gcm::new_from_slice(dek).map_err(|e| DataStoreError::AesError(e.to_string()))?;
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    let mut padded = pad(plaintext.as_bytes())?;
-    let commitment = compute_key_commitment(dek);
-
-    let payload = Payload {
-        msg: &padded,
-        aad: aad.as_bytes(),
-    };
-    let ciphertext = cipher
-        .encrypt(&nonce, payload)
-        .map_err(|e| DataStoreError::AesError(e.to_string()))?;
-
-    padded.zeroize();
-
-    // commitment (32 bytes) || nonce (12 bytes) || ciphertext+tag
-    let mut blob = Vec::with_capacity(32 + 12 + ciphertext.len());
-    blob.extend_from_slice(&commitment);
-    blob.extend_from_slice(&nonce);
-    blob.extend_from_slice(&ciphertext);
-
-    Ok(format!("ENC[{}]", STANDARD.encode(&blob)))
-}
-
-/// Decrypt a value in `ENC[base64(...)]` format using the given DEK.
-///
-/// The variable name must be provided as AAD — must match what was used
-/// during encryption or decryption will fail (GCM authentication check).
-pub fn decrypt_value(enc_str: &str, dek: &[u8], aad: &str) -> Result<String, DataStoreError> {
-    let inner = enc_str
-        .strip_prefix("ENC[")
-        .and_then(|s| s.strip_suffix(']'))
-        .ok_or(DataStoreError::InvalidFormat)?;
-
-    let blob = STANDARD.decode(inner)?;
-    // commitment (32) + nonce (12) + at least 16 bytes (GCM tag)
-    if blob.len() < 32 + 12 + 16 {
-        return Err(DataStoreError::InvalidFormat);
-    }
-
-    let (commitment, rest) = blob.split_at(32);
-    let (nonce_bytes, ciphertext) = rest.split_at(12);
-
-    // Verify key commitment before attempting decryption
-    verify_key_commitment(dek, commitment)?;
-
-    let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
-    let cipher =
-        Aes256Gcm::new_from_slice(dek).map_err(|e| DataStoreError::AesError(e.to_string()))?;
-
-    let payload = Payload {
-        msg: ciphertext,
-        aad: aad.as_bytes(),
-    };
-    let mut decrypted = cipher
-        .decrypt(nonce, payload)
-        .map_err(|e| DataStoreError::AesError(e.to_string()))?;
-
-    let plaintext = unpad(&decrypted)?.to_vec();
-    decrypted.zeroize();
-
-    String::from_utf8(plaintext).map_err(|e| DataStoreError::AesError(e.to_string()))
 }
 
 // --- Push to AWS services ---
@@ -330,7 +190,6 @@ async fn create_secrets_manager_client(
 }
 
 /// Push a value to AWS SSM Parameter Store.
-/// Uses SecureString for sensitive values, String for plaintext.
 pub async fn push_to_ssm(
     name: &str,
     value: &str,
@@ -358,7 +217,6 @@ pub async fn push_to_ssm(
 }
 
 /// Push a value to AWS Secrets Manager.
-/// Creates the secret if it doesn't exist, updates it if it does.
 pub async fn push_to_secrets_manager(
     name: &str,
     value: &str,
@@ -366,7 +224,6 @@ pub async fn push_to_secrets_manager(
 ) -> Result<(), DataStoreError> {
     let client = create_secrets_manager_client(region).await;
 
-    // Try updating first
     let result = client
         .put_secret_value()
         .secret_id(name)
@@ -377,7 +234,6 @@ pub async fn push_to_secrets_manager(
     match result {
         Ok(_) => Ok(()),
         Err(err) => {
-            // If the secret doesn't exist, create it
             let is_not_found = err
                 .as_service_error()
                 .is_some_and(|e| e.is_resource_not_found_exception());
@@ -396,11 +252,6 @@ pub async fn push_to_secrets_manager(
             }
         }
     }
-}
-
-/// Check if a value is in the `ENC[...]` envelope format.
-pub fn is_encrypted_value(value: &str) -> bool {
-    value.starts_with("ENC[") && value.ends_with(']')
 }
 
 #[cfg(test)]
@@ -432,7 +283,6 @@ mod tests {
     fn decrypt_wrong_aad_fails() {
         let dek = [0x42u8; 32];
         let encrypted = encrypt_value("secret", &dek, "API_KEY").unwrap();
-        // Decrypting with different AAD must fail
         assert!(decrypt_value(&encrypted, &dek, "DB_PASSWORD").is_err());
     }
 
@@ -442,7 +292,7 @@ mod tests {
         let dek2 = [0x43u8; 32];
         let encrypted = encrypt_value("secret", &dek1, "KEY").unwrap();
         let err = decrypt_value(&encrypted, &dek2, "KEY").unwrap_err();
-        assert!(matches!(err, DataStoreError::KeyCommitmentFailed));
+        assert!(matches!(err, CryptoError::KeyCommitmentFailed));
     }
 
     #[test]
@@ -481,29 +331,29 @@ mod tests {
     #[test]
     fn key_commitment_deterministic() {
         let dek = [0x42u8; 32];
-        let a = compute_key_commitment(&dek);
-        let b = compute_key_commitment(&dek);
+        let a = crypto::compute_key_commitment(&dek);
+        let b = crypto::compute_key_commitment(&dek);
         assert_eq!(a, b);
         assert_eq!(a.len(), 32);
     }
 
     #[test]
     fn key_commitment_differs_per_key() {
-        let a = compute_key_commitment(&[0x42u8; 32]);
-        let b = compute_key_commitment(&[0x43u8; 32]);
+        let a = crypto::compute_key_commitment(&[0x42u8; 32]);
+        let b = crypto::compute_key_commitment(&[0x43u8; 32]);
         assert_ne!(a, b);
     }
 
     #[test]
     fn pad_rejects_oversized_input() {
-        let data = vec![0u8; 65536]; // u16::MAX + 1
+        let data = vec![0u8; 65536];
         let result = pad(&data);
         assert!(result.is_err(), "pad should reject data larger than u16::MAX bytes");
     }
 
     #[test]
     fn pad_accepts_max_size() {
-        let data = vec![0u8; 65535]; // exactly u16::MAX
+        let data = vec![0u8; 65535];
         let result = pad(&data);
         assert!(result.is_ok(), "pad should accept data of exactly u16::MAX bytes");
     }

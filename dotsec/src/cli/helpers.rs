@@ -1,13 +1,36 @@
 use colored::Colorize;
 use inquire::{Confirm, Select, Text};
 use std::future::Future;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+static ANIMATION_DELAY: OnceLock<Duration> = OnceLock::new();
+
+/// Set a cosmetic delay applied after each `with_progress` future resolves
+/// but before the fade-out, so users can savor the animation.
+pub fn set_animation_delay(delay: Duration) {
+    let _ = ANIMATION_DELAY.set(delay);
+}
 
 /// Run an async operation with a dark_n_stormy glow animation as progress indicator.
 /// When done, the label fades to the terminal's foreground color.
 pub async fn with_progress<T>(label: &str, fut: impl Future<Output = T>) -> T {
     let anim = chromakopia::animate::glow(chromakopia::presets::dark_n_stormy(), label, 1.0);
     let result = fut.await;
-    anim.fade_to_foreground(std::time::Duration::from_millis(400)).await;
+    if let Some(delay) = ANIMATION_DELAY.get() {
+        let mut remaining = *delay;
+        let one_sec = Duration::from_secs(1);
+        while remaining >= one_sec {
+            anim.replace(&format!("{label} ({} sec)", remaining.as_secs()));
+            tokio::time::sleep(one_sec).await;
+            remaining -= one_sec;
+        }
+        if !remaining.is_zero() {
+            anim.replace(label);
+            tokio::time::sleep(remaining).await;
+        }
+    }
+    anim.fade_to_foreground(Duration::from_millis(400)).await;
     result
 }
 
@@ -170,23 +193,35 @@ pub fn config_diffs(source: &dotenv::FileConfig, existing: &dotenv::FileConfig) 
 
 /// Prompt for encryption provider config (like init).
 pub fn prompt_config() -> Result<dotenv::FileConfig, Box<dyn std::error::Error>> {
-    let provider = Select::new("Encryption provider?", vec!["aws"]).prompt()?;
-    let key_id = Text::new("KMS key ID?")
-        .with_default("alias/dotsec")
-        .prompt()?;
-    let default_region = std::env::var("AWS_REGION")
-        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|_| "us-east-1".to_string());
-    let region = Text::new("AWS region?")
-        .with_default(&default_region)
-        .prompt()?;
+    let provider = Select::new("Encryption provider?", vec!["local", "aws"]).prompt()?;
 
-    Ok(dotenv::FileConfig {
-        provider: Some(provider.to_string()),
-        key_id: Some(key_id),
-        region: Some(region),
-        default_encrypt: None,
-    })
+    match provider {
+        "local" => Ok(dotenv::FileConfig {
+            provider: Some("local".to_string()),
+            key_id: None,
+            region: None,
+            default_encrypt: None,
+        }),
+        "aws" => {
+            let key_id = Text::new("KMS key ID?")
+                .with_default("alias/dotsec")
+                .prompt()?;
+            let default_region = std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                .unwrap_or_else(|_| "us-east-1".to_string());
+            let region = Text::new("AWS region?")
+                .with_default(&default_region)
+                .prompt()?;
+
+            Ok(dotenv::FileConfig {
+                provider: Some("aws".to_string()),
+                key_id: Some(key_id),
+                region: Some(region),
+                default_encrypt: None,
+            })
+        }
+        _ => unreachable!(),
+    }
 }
 
 /// Prompt for encryption default. Uses source config if available.

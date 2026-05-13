@@ -1,6 +1,8 @@
 # Getting Started
 
-dotsec encrypts your `.env` files into `.sec` files using AWS KMS. The `.sec` file is committed to git as the single source of truth for your secrets — no more sharing credentials over Slack or managing secret vaults.
+dotsec encrypts your `.env` files into `.sec` files. The `.sec` file is committed to git as the single source of truth for your secrets — no more sharing credentials over Slack or managing secret vaults.
+
+Encryption uses age (X25519 + ChaCha20-Poly1305) by default. AWS KMS is also supported for enterprise teams.
 
 ## Install
 
@@ -21,7 +23,7 @@ cargo install dotsec
 @tab npx
 
 ```bash
-npx dotsec init
+npx dotsec set API_KEY sk-live-xxx
 ```
 
 :::
@@ -29,13 +31,20 @@ npx dotsec init
 ## Quick start
 
 ```bash
-dotsec init                              # set up AWS KMS key
-dotsec set API_KEY sk-live-xxx --encrypt # add a secret
-dotsec import                            # migrate existing .env → .sec
-dotsec run -- node server.js             # run with decrypted env vars
+dotsec set API_KEY sk-live-xxx --encrypt  # add a secret (auto-creates .sec + keypair)
+dotsec set PORT 3000                      # add a plaintext var
+dotsec run -- node server.js              # run with decrypted env vars (from .sec)
+dotsec run --env-file .env -- node server.js  # or from a plain .env
 ```
 
-That's it. Your `.sec` file goes into git, your `.env` stays in `.gitignore`.
+That's it. Your `.sec` file goes into git, your `.sec.key` stays in `.gitignore`.
+
+## Import an existing .env
+
+```bash
+dotsec import              # .env → .sec (interactive)
+dotsec import -y           # auto-detect types and encryption
+```
 
 ## Core workflow
 
@@ -50,26 +59,58 @@ That's it. Your `.sec` file goes into git, your `.env` stays in `.gitignore`.
                                 decrypt
 ```
 
-Each secret is encrypted individually with AES-256-GCM using a local data key (DEK) wrapped by KMS. This makes `.sec` files git-mergeable — changing one secret only affects that line.
+Each secret is encrypted individually with AES-256-GCM using a data encryption key (DEK). The DEK is wrapped by your keypair (or AWS KMS) and stored in the `.sec` file. This makes `.sec` files git-mergeable — changing one secret only affects that line.
+
+## Commands
 
 ```bash
-dotsec import              # .env → .sec (encrypts values marked with @encrypt)
-dotsec export              # .sec → .env (decrypts)
-dotsec show                # display decrypted .sec contents
-dotsec validate            # check directives and values
-dotsec diff .env .env.staging  # compare env files
-dotsec run -- npm start    # inject decrypted vars into a command
-dotsec eject               # extract directives into dotsec.schema
+dotsec set KEY value              # add or update a variable
+dotsec show                       # display decrypted .sec contents
+dotsec export -o .env             # .sec → .env (decrypts to file)
+dotsec run -- npm start           # inject decrypted vars into a command
+dotsec validate                   # check directives and values
+dotsec diff .sec.staging          # compare .sec files
+dotsec rotate-key                 # generate new DEK, re-encrypt all values
+dotsec extract-schema             # extract directives into dotsec.schema
+dotsec schema export              # export schema as JSON Schema
+dotsec schema export --format ts  # generate TypeScript types
 ```
+
+## Encryption providers
+
+### Local (default)
+
+No cloud account needed. Uses age (X25519 + ChaCha20-Poly1305) keypairs.
+
+- Private key: `.sec.key` file or `DOTSEC_PRIVATE_KEY` env var
+- Auto-generated on first use
+- Team sharing: send `.sec.key` via secure channel
+
+### AWS KMS
+
+For enterprise teams needing IAM-controlled access and CloudTrail audit logs.
+
+```bash
+dotsec init  # choose "aws", enter KMS key ID and region
+```
+
+See the [encryption guide](/guide/encryption) for details.
 
 ## Multi-environment support
 
-For projects with multiple `.sec` files (dev, staging, production), extract shared directives into a `dotsec.schema` file:
+Use separate `.sec` files per environment, each with its own keypair:
 
 ```bash
-dotsec eject --sec-file dev.sec      # creates dotsec.schema, strips directives from dev.sec
-cp dev.sec staging.sec               # create new environment
-dotsec validate --sec-file staging.sec   # validates against shared schema
+SEC_FILE=.sec.staging dotsec set DB_URL postgres://staging-db
+SEC_FILE=.sec.production dotsec set DB_URL postgres://prod-db
+```
+
+Extract shared directives into a `dotsec.schema` file:
+
+```bash
+dotsec extract-schema              # creates dotsec.schema from .sec
+dotsec validate                    # validates against schema
+dotsec schema export --format ts   # generate TypeScript types
 ```
 
 The schema uses the same directive syntax with bare keys (no values):
@@ -77,7 +118,7 @@ The schema uses the same directive syntax with bare keys (no values):
 ```bash
 # @default-encrypt
 
-# @type=string @push=aws-ssm @not-empty
+# @type=string @not-empty
 DATABASE_URL
 
 # @type=number @min=0 @max=65535
@@ -104,7 +145,7 @@ import {
   parse, validate, toJson, format,
   loadSchema, validateAgainstSchema, formatBySchema,
   parseSchema, schemaToJsonSchema, schemaToTypescript,
-  discoverSchema
+  discoverSchema, generateHeader, hasHeader
 } from '@dotsec/core';
 import { readFileSync } from 'node:fs';
 
@@ -172,20 +213,6 @@ for err in &errors {
 }
 ```
 
-Encrypt and decrypt with AWS KMS:
-
-```rust
-use dotsec_core::{load_file, parse_content, encrypt_lines_to_sec};
-use dotsec_core::{EncryptionEngine, AwsEncryptionOptions};
-
-let content = load_file(".env").unwrap();
-let lines = parse_content(&content).unwrap();
-encrypt_lines_to_sec(&lines, ".sec", &EncryptionEngine::Aws(AwsEncryptionOptions {
-    key_id: Some("alias/dotsec".into()),
-    region: Some("eu-west-1".into()),
-})).await.unwrap();
-```
-
 ## Channels
 
 | Channel | npm | Cargo |
@@ -202,5 +229,6 @@ dotsec/            CLI binary (uses dotsec-core)
 dotsec-napi/       Node.js bindings (published as @dotsec/core)
   npm/             npm platform packages
 dotenv/            .env/.sec parser (internal)
-aws/               AWS KMS encryption (internal)
+crypto/            Shared cryptography + local age encryption (internal)
+aws/               AWS KMS encryption + push (internal)
 ```

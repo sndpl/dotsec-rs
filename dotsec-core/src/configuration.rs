@@ -2,6 +2,7 @@
 #[derive(Clone, Debug, Default)]
 pub enum EncryptionEngine {
     Aws(AwsEncryptionOptions),
+    Local(LocalEncryptionOptions),
     #[default]
     None,
 }
@@ -21,6 +22,11 @@ impl std::fmt::Debug for AwsEncryptionOptions {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct LocalEncryptionOptions {
+    pub key_file: Option<String>,
+}
+
 impl TryFrom<dotenv::FileConfig> for EncryptionEngine {
     type Error = String;
 
@@ -30,8 +36,11 @@ impl TryFrom<dotenv::FileConfig> for EncryptionEngine {
                 key_id: config.key_id,
                 region: config.region,
             })),
+            Some("local") => Ok(EncryptionEngine::Local(LocalEncryptionOptions {
+                key_file: config.key_id,
+            })),
             Some(unknown) => Err(format!(
-                "unknown encryption provider '{}', expected 'aws'",
+                "unknown encryption provider '{}', expected 'aws' or 'local'",
                 unknown
             )),
             None => Ok(EncryptionEngine::None),

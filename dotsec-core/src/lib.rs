@@ -37,7 +37,7 @@ pub fn generate_header() -> Vec<Line> {
     vec![
         Line::Comment { text: "# dotsec v5 — encrypted environment file".into() },
         Line::Newline,
-        Line::Comment { text: "# https://github.com/jpwesselink/dotsec-rs#getting-started".into() },
+        Line::Comment { text: "# https://github.com/jpwesselink/dotsec-rs".into() },
         Line::Newline,
     ]
 }
@@ -97,32 +97,51 @@ pub async fn encrypt_lines_to_sec(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entries = lines_to_entries(lines);
 
-    let (key_id, region) = match encryption_engine {
-        EncryptionEngine::Aws(opts) => (
-            opts.key_id.as_deref().ok_or("AWS key_id is required")?,
-            opts.region.as_deref(),
-        ),
+    let (dek, wrapped_dek) = match encryption_engine {
+        EncryptionEngine::Aws(opts) => {
+            let key_id = opts.key_id.as_deref().ok_or("AWS key_id is required")?;
+            let region = opts.region.as_deref();
+            match load_existing_dek_aws(sec_file, region).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let is_new = is_new_or_no_key(&e);
+                    if is_new {
+                        aws::generate_data_key(key_id, region).await?
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        EncryptionEngine::Local(opts) => {
+            let private_key = crypto::local::load_private_key(sec_file, opts.key_file.as_deref())?;
+            let recipient = crypto::local::recipient_from_identity(&private_key)?;
+            match load_existing_dek_local(sec_file, &private_key) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let is_new = is_new_or_no_key(&e);
+                    if is_new {
+                        let dek = crypto::generate_dek();
+                        let wrapped = crypto::local::wrap_dek(&dek, &recipient)?;
+                        (dek, wrapped)
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
         EncryptionEngine::None => return Err("Encryption engine is required".into()),
     };
 
-    // Check if there's an existing __DOTSEC_KEY__ we can reuse
-    let (dek, wrapped_dek) = match load_existing_dek(sec_file, region).await {
-        Ok((dek, wrapped)) => (dek, wrapped),
-        Err(e) => {
-            let is_new_file = e.downcast_ref::<std::io::Error>()
-                .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound);
-            let is_no_key = e.to_string().contains("No __DOTSEC_KEY__ found");
-            if is_new_file || is_no_key {
-                let (plaintext, wrapped) = aws::generate_data_key(key_id, region).await?;
-                (plaintext, wrapped)
-            } else {
-                return Err(e);
-            }
-        }
-    };
-
-    // DEK is Zeroizing<Vec<u8>> — auto-zeroizes on drop (including error paths)
     encrypt_with_dek(lines, &entries, &dek, &wrapped_dek, sec_file)
+}
+
+#[allow(clippy::borrowed_box)]
+fn is_new_or_no_key(e: &Box<dyn std::error::Error>) -> bool {
+    let is_new_file = e.downcast_ref::<std::io::Error>()
+        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound);
+    let is_no_key = e.to_string().contains("No __DOTSEC_KEY__ found");
+    is_new_file || is_no_key
 }
 
 /// Inner encryption logic, separated so the caller can zeroize the DEK.
@@ -159,10 +178,10 @@ fn encrypt_with_dek(
                 let should_encrypt = entry.is_some_and(|e| e.has_directive("encrypt"));
 
                 if should_encrypt {
-                    if aws::is_encrypted_value(value) {
+                    if crypto::is_encrypted_value(value) {
                         sec_lines.push(line.clone());
                     } else {
-                        let encrypted = aws::encrypt_value(value, dek, key)?;
+                        let encrypted = crypto::encrypt_value(value, dek, key)?;
                         sec_lines.push(Line::Kv { key: key.clone(), value: encrypted, quote_type: quote_type.clone() });
                     }
                 } else {
@@ -211,11 +230,11 @@ pub async fn decrypt_sec_to_lines(
     let lines = dotenv::parse_dotenv(&content)?;
 
     match detect_format(&lines) {
-        SecFormat::V2 => decrypt_v2(&lines, encryption_engine).await,
+        SecFormat::V2 => decrypt_v2(sec_file, &lines, encryption_engine).await,
         SecFormat::V1 => decrypt_v1(&lines, encryption_engine).await,
         SecFormat::None => {
             let has_enc_values = lines.iter().any(|l| {
-                if let Line::Kv { value: v, .. } = l { aws::is_encrypted_value(v) } else { false }
+                if let Line::Kv { value: v, .. } = l { crypto::is_encrypted_value(v) } else { false }
             });
             if has_enc_values {
                 return Err("File contains ENC[...] values but no __DOTSEC_KEY__. File may be corrupted.".into());
@@ -227,20 +246,24 @@ pub async fn decrypt_sec_to_lines(
 
 /// Decrypt v2 format: unwrap DEK from __DOTSEC_KEY__, then decrypt each ENC[...] value.
 async fn decrypt_v2(
+    sec_file: &str,
     lines: &[Line],
     encryption_engine: &EncryptionEngine,
 ) -> Result<Vec<Line>, Box<dyn std::error::Error>> {
-    let region = match encryption_engine {
-        EncryptionEngine::Aws(opts) => opts.region.as_deref(),
-        EncryptionEngine::None => return Err("Encryption engine is required".into()),
-    };
-
-    // Find and unwrap the DEK
     let wrapped_dek_b64 = dotenv::get_value(lines, DOTSEC_KEY_NAME)
         .ok_or("No __DOTSEC_KEY__ found in .sec file")?;
     let wrapped_dek = base64::engine::general_purpose::STANDARD.decode(&wrapped_dek_b64)?;
-    // DEK is Zeroizing<Vec<u8>> — auto-zeroizes on drop (including error paths)
-    let dek = aws::unwrap_data_key(&wrapped_dek, region).await?;
+
+    let dek = match encryption_engine {
+        EncryptionEngine::Aws(opts) => {
+            aws::unwrap_data_key(&wrapped_dek, opts.region.as_deref()).await?
+        }
+        EncryptionEngine::Local(opts) => {
+            let private_key = crypto::local::load_private_key(sec_file, opts.key_file.as_deref())?;
+            crypto::local::unwrap_dek(&wrapped_dek, &private_key)?
+        }
+        EncryptionEngine::None => return Err("Encryption engine is required".into()),
+    };
 
     let mut resolved: Vec<Line> = Vec::new();
 
@@ -250,8 +273,8 @@ async fn decrypt_v2(
                 if key == DOTSEC_KEY_NAME {
                     continue;
                 }
-                if aws::is_encrypted_value(value) {
-                    let plaintext = aws::decrypt_value(value, &dek, key)?;
+                if crypto::is_encrypted_value(value) {
+                    let plaintext = crypto::decrypt_value(value, &dek, key)?;
                     resolved.push(Line::Kv { key: key.clone(), value: plaintext, quote_type: quote_type.clone() });
                 } else {
                     resolved.push(line.clone());
@@ -335,17 +358,32 @@ async fn decrypt_blob_v1(
 
 // --- DEK helpers ---
 
+type DekPair = (zeroize::Zeroizing<Vec<u8>>, Vec<u8>);
+
 /// Try to load and unwrap the existing DEK from a .sec file.
-async fn load_existing_dek(
+async fn load_existing_dek_aws(
     sec_file: &str,
     region: Option<&str>,
-) -> Result<(zeroize::Zeroizing<Vec<u8>>, Vec<u8>), Box<dyn std::error::Error>> {
+) -> Result<DekPair, Box<dyn std::error::Error>> {
     let content = load_file(sec_file)?;
     let lines = dotenv::parse_dotenv(&content)?;
     let wrapped_b64 = dotenv::get_value(&lines, DOTSEC_KEY_NAME)
         .ok_or("No __DOTSEC_KEY__ found")?;
     let wrapped_dek = base64::engine::general_purpose::STANDARD.decode(&wrapped_b64)?;
     let dek = aws::unwrap_data_key(&wrapped_dek, region).await?;
+    Ok((dek, wrapped_dek))
+}
+
+fn load_existing_dek_local(
+    sec_file: &str,
+    identity: &str,
+) -> Result<DekPair, Box<dyn std::error::Error>> {
+    let content = load_file(sec_file)?;
+    let lines = dotenv::parse_dotenv(&content)?;
+    let wrapped_b64 = dotenv::get_value(&lines, DOTSEC_KEY_NAME)
+        .ok_or("No __DOTSEC_KEY__ found")?;
+    let wrapped_dek = base64::engine::general_purpose::STANDARD.decode(&wrapped_b64)?;
+    let dek = crypto::local::unwrap_dek(&wrapped_dek, identity)?;
     Ok((dek, wrapped_dek))
 }
 
@@ -496,7 +534,7 @@ mod tests {
     #[test]
     fn generate_header_second_line_contains_url() {
         let header = generate_header();
-        assert!(matches!(&header[2], Line::Comment { text } if text.contains("github.com/jpwesselink/dotsec-rs")));
+        assert!(matches!(&header[2], Line::Comment { text } if text.contains("https://github.com/jpwesselink/dotsec-rs")));
     }
 
     #[test]
@@ -876,7 +914,7 @@ mod tests {
         // But we can detect the ENC values are present, which should be an error condition
         let has_enc_values = lines.iter().any(|l| {
             if let Line::Kv { value: v, .. } = l {
-                aws::is_encrypted_value(v)
+                crypto::is_encrypted_value(v)
             } else {
                 false
             }
@@ -998,5 +1036,121 @@ mod tests {
         assert_eq!(entries[0].key, "FOO");
         assert_eq!(entries[0].value, "hello");
         assert!(!entries[0].has_directive("encrypt"), "plaintext default should not add encrypt");
+    }
+
+    // --- local encryption integration ---
+
+    #[tokio::test]
+    async fn local_encrypt_decrypt_roundtrip() {
+        let dir = std::env::temp_dir().join("dotsec-test-local-roundtrip");
+        let _ = std::fs::create_dir_all(&dir);
+        let sec_file = dir.join("test.sec").to_string_lossy().to_string();
+        let key_file = dir.join("test.sec.key").to_string_lossy().to_string();
+
+        let (identity, _) = crypto::local::generate_keypair();
+        std::fs::write(&key_file, &identity).unwrap();
+
+        let lines = vec![
+            Line::Directive { name: "provider".to_string(), value: Some("local".to_string()) },
+            Line::Newline,
+            Line::Directive { name: "encrypt".to_string(), value: None },
+            Line::Newline,
+            Line::Kv { key: "SECRET".into(), value: "hunter2".into(), quote_type: QuoteType::Double },
+            Line::Newline,
+            Line::Kv { key: "PUBLIC".into(), value: "hello".into(), quote_type: QuoteType::None },
+            Line::Newline,
+        ];
+
+        let engine = EncryptionEngine::Local(LocalEncryptionOptions {
+            key_file: Some(key_file.clone()),
+        });
+
+        encrypt_lines_to_sec(&lines, &sec_file, &engine).await.unwrap();
+
+        let content = std::fs::read_to_string(&sec_file).unwrap();
+        assert!(content.contains("ENC["), "encrypted value should contain ENC[...]");
+        assert!(content.contains("__DOTSEC_KEY__"), "should contain wrapped DEK");
+        assert!(!content.contains("hunter2"), "plaintext should not appear");
+
+        let decrypted = decrypt_sec_to_lines(&sec_file, &engine).await.unwrap();
+        let secret_val = decrypted.iter().find_map(|l| {
+            if let Line::Kv { key, value, .. } = l { if key == "SECRET" { Some(value.clone()) } else { None } } else { None }
+        });
+        assert_eq!(secret_val.as_deref(), Some("hunter2"));
+
+        let public_val = decrypted.iter().find_map(|l| {
+            if let Line::Kv { key, value, .. } = l { if key == "PUBLIC" { Some(value.clone()) } else { None } } else { None }
+        });
+        assert_eq!(public_val.as_deref(), Some("hello"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn local_decrypt_with_wrong_key_fails() {
+        let dir = std::env::temp_dir().join("dotsec-test-local-wrong-key");
+        let _ = std::fs::create_dir_all(&dir);
+        let sec_file = dir.join("test.sec").to_string_lossy().to_string();
+        let key_file = dir.join("test.sec.key").to_string_lossy().to_string();
+        let wrong_key_file = dir.join("wrong.sec.key").to_string_lossy().to_string();
+
+        let (identity, _) = crypto::local::generate_keypair();
+        let (wrong_identity, _) = crypto::local::generate_keypair();
+        std::fs::write(&key_file, &identity).unwrap();
+        std::fs::write(&wrong_key_file, &wrong_identity).unwrap();
+
+        let lines = vec![
+            Line::Directive { name: "encrypt".to_string(), value: None },
+            Line::Newline,
+            Line::Kv { key: "SECRET".into(), value: "hunter2".into(), quote_type: QuoteType::Double },
+            Line::Newline,
+        ];
+
+        let engine = EncryptionEngine::Local(LocalEncryptionOptions {
+            key_file: Some(key_file),
+        });
+
+        encrypt_lines_to_sec(&lines, &sec_file, &engine).await.unwrap();
+
+        let wrong_engine = EncryptionEngine::Local(LocalEncryptionOptions {
+            key_file: Some(wrong_key_file),
+        });
+        let result = decrypt_sec_to_lines(&sec_file, &wrong_engine).await;
+        assert!(result.is_err(), "decrypting with wrong key should fail");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn local_decrypt_discovers_sibling_key_file() {
+        let dir = std::env::temp_dir().join("dotsec-test-local-discovery");
+        let _ = std::fs::create_dir_all(&dir);
+        let sec_file = dir.join("test.sec").to_string_lossy().to_string();
+        let key_file = dir.join("test.sec.key").to_string_lossy().to_string();
+
+        let (identity, _) = crypto::local::generate_keypair();
+        std::fs::write(&key_file, &identity).unwrap();
+
+        let lines = vec![
+            Line::Directive { name: "encrypt".to_string(), value: None },
+            Line::Newline,
+            Line::Kv { key: "SECRET".into(), value: "hunter2".into(), quote_type: QuoteType::Double },
+            Line::Newline,
+        ];
+
+        let encrypt_engine = EncryptionEngine::Local(LocalEncryptionOptions {
+            key_file: Some(key_file.clone()),
+        });
+        encrypt_lines_to_sec(&lines, &sec_file, &encrypt_engine).await.unwrap();
+
+        // Decrypt with key_file: None — must auto-discover <sec>.key.
+        let decrypt_engine = EncryptionEngine::Local(LocalEncryptionOptions { key_file: None });
+        let decrypted = decrypt_sec_to_lines(&sec_file, &decrypt_engine).await.unwrap();
+        let secret_val = decrypted.iter().find_map(|l| {
+            if let Line::Kv { key, value, .. } = l { if key == "SECRET" { Some(value.clone()) } else { None } } else { None }
+        });
+        assert_eq!(secret_val.as_deref(), Some("hunter2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

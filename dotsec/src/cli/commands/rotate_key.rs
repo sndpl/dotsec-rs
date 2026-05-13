@@ -21,14 +21,6 @@ pub async fn match_args(
     let sec_file = default_options.sec_file;
     let encryption_engine = &default_options.encryption_engine;
 
-    let (key_id, region) = match encryption_engine {
-        dotsec::EncryptionEngine::Aws(opts) => (
-            opts.key_id.as_deref().ok_or("AWS key_id is required")?,
-            opts.region.as_deref(),
-        ),
-        dotsec::EncryptionEngine::None => return Err("Encryption engine is required".into()),
-    };
-
     // Decrypt all values with the old DEK
     let lines = with_progress(
         "Decrypting with old key...",
@@ -36,8 +28,21 @@ pub async fn match_args(
     )
     .await?;
 
-    // Generate a new DEK (Zeroizing<Vec<u8>> — auto-zeroizes on drop)
-    let (new_dek, new_wrapped_dek) = aws::generate_data_key(key_id, region).await?;
+    // Generate a new DEK and wrap it with the appropriate provider
+    let (new_dek, new_wrapped_dek) = match encryption_engine {
+        dotsec::EncryptionEngine::Aws(opts) => {
+            let key_id = opts.key_id.as_deref().ok_or("AWS key_id is required")?;
+            aws::generate_data_key(key_id, opts.region.as_deref()).await?
+        }
+        dotsec::EncryptionEngine::Local(opts) => {
+            let private_key = crypto::local::load_private_key(sec_file, opts.key_file.as_deref())?;
+            let recipient = crypto::local::recipient_from_identity(&private_key)?;
+            let dek = crypto::generate_dek();
+            let wrapped = crypto::local::wrap_dek(&dek, &recipient)?;
+            (dek, wrapped)
+        }
+        dotsec::EncryptionEngine::None => return Err("Encryption engine is required".into()),
+    };
     let new_wrapped_b64 =
         base64::engine::general_purpose::STANDARD.encode(&new_wrapped_dek);
 
@@ -52,7 +57,7 @@ pub async fn match_args(
                 let should_encrypt = entry.is_some_and(|e| e.has_directive("encrypt"));
 
                 if should_encrypt {
-                    let encrypted = aws::encrypt_value(value, &new_dek, key)?;
+                    let encrypted = crypto::encrypt_value(value, &new_dek, key)?;
                     sec_lines.push(dotenv::Line::Kv { key: key.clone(), value: encrypted, quote_type: quote_type.clone() });
                 } else {
                     sec_lines.push(line.clone());

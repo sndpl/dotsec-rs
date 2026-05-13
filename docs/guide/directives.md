@@ -1,13 +1,10 @@
 # Directives
 
-Directives are comments that control encryption, typing, validation, and push targets:
+Directives are comments that control encryption, typing, validation, and push targets. They sit on the line immediately above the key they apply to:
 
 ```bash
-# @provider=aws @key-id=alias/dotsec @region=us-east-1 @default-encrypt
-
 # @encrypt
-# @type=string
-# @push=aws-ssm(path="/myapp/prod/db-url")
+# @type=string @format=url @not-empty
 DATABASE_URL="postgres://user:pass@localhost:5432/mydb"
 
 # @plaintext
@@ -19,17 +16,19 @@ NODE_ENV="production"
 PORT=3000
 ```
 
+Directives must start with `#` — writing `@directive` without `#` is a parse error.
+
 ## Available directives
 
 ### File-level directives
 
-These go at the top of the `.sec` file (or in `dotsec.schema`):
+These go at the top of the `.sec` file (or in `dotsec.schema`) and apply to the whole file:
 
 | Directive | Value | Description |
 |-----------|-------|-------------|
-| `@provider` | `aws` | Encryption provider |
-| `@key-id` | KMS key ID or alias | KMS key to use |
-| `@region` | AWS region | AWS region |
+| `@provider` | `local`, `aws` | Encryption provider (`local` is the default) |
+| `@key-id` | KMS key ID or alias | KMS key to use (AWS only) |
+| `@region` | AWS region | AWS region (AWS only) |
 | `@default-encrypt` | none | Encrypt all variables by default |
 | `@default-plaintext` | none | Don't encrypt by default |
 
@@ -82,7 +81,7 @@ PORT=3000
 # @type=string @min-length=1 @max-length=255 @not-empty
 APP_NAME="my-app"
 
-# Optional key
+# Optional key (not required in schema validation)
 # @optional
 SENTRY_DSN="https://sentry.io"
 
@@ -116,7 +115,7 @@ APP_VERSION="2.1.0"
 
 ## Schema files
 
-When a project has multiple `.sec` files (dev, staging, production), per-key directives would be duplicated across all files. A **schema file** (`dotsec.schema`) solves this by extracting shared directives into a single file.
+When a project has multiple `.sec` files (dev, staging, production), per-key directives would be duplicated across all files. A **schema file** (`dotsec.schema`) solves this by extracting shared directives into one place.
 
 ### Schema format
 
@@ -145,8 +144,8 @@ With a schema in place:
 - **Schema file** (`dotsec.schema`) holds all per-key directives: `@type`, `@push`, `@encrypt`, `@format`, `@pattern`, `@min`/`@max`, `@optional`, `@deprecated`, etc.
 - **`.sec` files** hold only file-level directives (`@provider`, `@key-id`, `@region`) and key=value pairs
 - `dotsec validate` checks `.sec` entries against the schema: missing keys, extra keys, type mismatches, constraint violations
-- `dotsec set` automatically writes directives to the schema (not inline in `.sec`)
-- Inline per-key directives in `.sec` files are ignored when a schema exists (with a warning)
+- `dotsec set` automatically writes new key directives to the schema (not inline in `.sec`)
+- Inline per-key directives in `.sec` files are an **error** when a schema exists — use `dotsec remove-directives` to clean them up
 
 ### Directive classification
 
@@ -167,17 +166,23 @@ The schema file is found automatically:
 2. `DOTSEC_SCHEMA` environment variable
 3. `dotsec.schema` in the same directory as the `.sec` file
 
-See [eject command](/guide/commands#dotsec-eject) for how to create a schema from an existing `.sec` file.
+### Creating a schema
+
+Run `dotsec extract-schema` on an existing `.sec` file to extract per-key directives into `dotsec.schema`:
+
+```bash
+dotsec extract-schema
+```
+
+See [extract-schema command](/guide/commands#dotsec-extract-schema) for details.
 
 ## Choosing between inline and schema
 
-**Use inline directives** when you have a single environment, a small project, or you want to get started quickly. Everything lives in one `.sec` file, so there is nothing extra to manage.
+**Use inline directives** when you have a single environment or a small project. Everything lives in one `.sec` file — nothing extra to manage.
 
-**Use a schema file** when you have multiple environments (dev, staging, production), collaborate with a team, run CI/CD validation across environments, or want to generate typed code from your configuration. A shared `dotsec.schema` keeps directive definitions in one place and prevents drift between environment files.
+**Use a schema file** when you have multiple environments, collaborate with a team, or want to generate typed code. A shared `dotsec.schema` keeps directive definitions in one place and prevents drift.
 
-**Migration path**: start with inline directives, then run `dotsec eject` when you need a schema. This extracts per-key directives into `dotsec.schema` and strips them from your `.sec` file, leaving only file-level config and key=value pairs.
-
-When both inline directives and a schema file exist, the schema takes precedence. Any per-key directives still present in the `.sec` file are ignored, and `dotsec validate` will emit a warning for each one so you can clean them up (or run `dotsec remove-directives` to strip them automatically).
+**Migration path**: start with inline directives, then run `dotsec extract-schema` when you're ready. This moves per-key directives to `dotsec.schema` and strips them from your `.sec` file.
 
 ## Variable interpolation
 
@@ -193,10 +198,10 @@ WEBHOOK_URL="${BASE_URL}/webhooks"
 
 ## Configuration
 
-All configuration lives in the `.sec` file itself as directives — no external config file needed:
+All file-level configuration lives in the `.sec` file as directives — no external config file needed:
 
 ```bash
-# @provider=aws @key-id=alias/dotsec @region=us-east-1 @default-encrypt
+# @provider=local @default-encrypt
 
 DATABASE_URL="postgres://..."
 API_KEY="sk-..."

@@ -30,7 +30,7 @@ const errors = validate('# @bogus\nFOO="bar"\n');
 
 // Convert to JSON
 const json = toJson('FOO=bar\nPORT=3000\n');
-// '[{"FOO":"bar"},{"PORT":"3000"}]'
+// '{"FOO":"bar","PORT":"3000"}'
 
 // Roundtrip format
 const formatted = format('FOO=bar\n');
@@ -68,8 +68,16 @@ const typescript = schemaToTypescript(schemaSource);    // TypeScript declaratio
 - `@encrypt` / `@plaintext` — mark variables for encryption
 - `@default-encrypt` / `@default-plaintext` — file-level defaults
 - `@type=string|number|boolean|enum("a","b")` — value type validation
+- `@format=email|url|uuid|ipv4|ipv6|date|semver` — format validation
+- `@pattern="regex"` — regex pattern validation
+- `@min` / `@max` — numeric range constraints
+- `@min-length` / `@max-length` — string length constraints
+- `@not-empty` — value must not be empty
+- `@optional` — key not required in schema validation
+- `@description` — human-readable description
+- `@deprecated` — mark key as deprecated (optional message)
 - `@push=aws-ssm|aws-secrets-manager` — push targets with options
-- `@provider`, `@key-id`, `@region` — file-level encryption config
+- `@provider=local|aws`, `@key-id`, `@region` — file-level encryption config
 
 See the [full documentation](https://jpwesselink.github.io/dotsec-rs/guide/directives.html) for details.
 

@@ -19,7 +19,7 @@ pub async fn match_args(
     matches: &clap::ArgMatches,
     default_options: &DefaultOptions<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(sub) = matches.subcommand_matches("extract-schema").or_else(|| matches.subcommand_matches("eject")) {
+    if let Some(sub) = matches.subcommand_matches("extract-schema") {
         let sec_file = default_options.sec_file;
         let output = sub.get_one::<String>("output").unwrap();
 

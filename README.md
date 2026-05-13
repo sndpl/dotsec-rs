@@ -1,283 +1,106 @@
 # dotsec
 
-Encrypt and manage `.env` files with AWS KMS envelope encryption.
+`.env` files, encrypted and committed to git.
 
-`.env` is plaintext, `.sec` is its encrypted counterpart — committed to git as the single source of truth for secrets.
+dotsec encrypts your secrets into a `.sec` file — committed alongside your code as the single source of truth. Decrypt at runtime with no secrets ever written to disk.
 
 ## Install
 
 ```bash
-# stable
 npm install -g dotsec
-
-# beta (latest from main)
-npm install -g dotsec@beta
-
-# PR preview
-npm install -g dotsec@pr-42
-
-# cargo
+# or
 cargo install dotsec
-```
-
-| Channel | Trigger | Version | Install |
-|---------|---------|---------|---------|
-| `latest` | Release PR merge | `5.0.0` | `npm install dotsec` |
-| `beta` | Every commit on `main` | `5.0.0-beta.abc1234` | `npm install dotsec@beta` |
-| `pr-N` | Every commit on a PR | `5.0.0-pr-42.abc1234` | `npm install dotsec@pr-42` |
-
-## Project structure
-
-```
-dotsec-core/             Core library (encryption, decryption, interpolation, redaction)
-dotsec/                  CLI binary crate (uses dotsec-core)
-  npm/                   npm distribution packages
-    dotsec/              meta-package (optionalDependencies)
-    dotsec-darwin-arm64/ platform binaries
-    dotsec-darwin-x64/
-    dotsec-linux-arm64-gnu/
-    dotsec-linux-x64-gnu/
-    dotsec-win32-arm64-msvc/
-    dotsec-win32-x64-msvc/
-dotsec-napi/             Node.js bindings (published as @dotsec/core)
-  npm/                   npm platform packages
-dotenv/                  .env/.sec parser (internal)
-aws/                     AWS KMS encryption (internal)
 ```
 
 ## Quick start
 
 ```bash
-dotsec init                          # set up encryption config
-dotsec set                           # add a variable interactively
-dotsec set API_KEY sk-live-xxx --encrypt  # add inline
-dotsec import                        # migrate .env → .sec
-dotsec export                        # .sec → .env (decrypts)
-dotsec show                          # show decrypted .sec contents
-dotsec run -- node server.js         # run with decrypted env vars
-dotsec validate                      # check directives and values
-dotsec diff .env.staging             # compare .sec files
+dotsec set API_KEY sk-live-xxx --encrypt   # creates .sec + keypair on first run
+dotsec set PORT 3000                       # plaintext variable
+dotsec run -- node server.js               # inject decrypted vars into your process
 ```
 
-## Commands
+That's it. `.sec` goes into git. `.sec.key` stays out (auto-added to `.gitignore`).
 
-### `dotsec init`
+No AWS account. No config file. No setup step.
 
-Interactive setup that creates a `.sec` file with encryption config:
+## How it works
 
-1. Prompts for provider, KMS key ID, region
-2. Asks encrypt-all or encrypt-none default
-3. Writes config as directives at the top of `.sec`
-
-### `dotsec set`
-
-Add or update a single variable. Interactive mode prompts for encryption, type, and push target. Non-interactive mode uses flags:
-
-```bash
-dotsec set                                    # fully interactive
-dotsec set DB_URL postgres://... --encrypt    # inline with flag
-dotsec set PORT 3000 --type number            # with type directive
+```
+.env (plaintext, gitignored)        .sec (encrypted, committed)
+┌────────────────────────┐          ┌──────────────────────────┐
+│ DATABASE_URL=postgres://│ encrypt │ DATABASE_URL=ENC[base64] │
+│ API_KEY=sk-live-xxx    │ ──────▶ │ API_KEY=ENC[base64]      │
+│ PORT=3000              │         │ PORT=3000                 │
+└────────────────────────┘         │ __DOTSEC_KEY__="..."     │
+                             ◀──── └──────────────────────────┘
+                            decrypt
 ```
 
-Plaintext variables are written directly — no KMS round trip. Encrypted variables trigger decrypt → modify → re-encrypt.
+Each secret is encrypted individually with AES-256-GCM using a data encryption key (DEK). The DEK is wrapped by your age keypair and stored in the `.sec` file. This makes `.sec` files git-mergeable — changing one secret only affects that line.
 
-### `dotsec import`
-
-Migrate a `.env` file into `.sec`. Walks through each variable prompting for encryption, type, and push targets.
+## Common commands
 
 ```bash
-dotsec import                  # import from .env (default)
-dotsec import .env.production  # import from specific file
+dotsec set KEY value --encrypt     # add/update an encrypted variable
+dotsec set KEY value               # add/update a plaintext variable
+dotsec import                      # .env → .sec (interactive)
+dotsec import -y                   # .env → .sec (auto-detect types)
+dotsec run -- <command>            # run with decrypted env vars
+dotsec show                        # display decrypted .sec (values masked)
+dotsec show --reveal               # display decrypted .sec (plaintext)
+dotsec export -o .env              # .sec → .env
+dotsec validate                    # check types and constraints
+dotsec extract-schema              # extract directives → dotsec.schema
+dotsec schema export --format ts   # generate TypeScript types from schema
+dotsec rotate-key                  # generate new DEK, re-encrypt all values
 ```
 
-If `.sec` already exists, offers: import new variables only, overwrite all, or cancel. Source `.env` directives pre-populate the prompts as defaults.
+## Team sharing
 
-If `.sec` doesn't exist, prompts for encryption config (like `init`).
-
-### `dotsec export`
-
-Decrypt `.sec` and write to `.env`:
+Share `.sec.key` over a secure channel (1Password, Bitwarden, etc.). For CI/CD:
 
 ```bash
-dotsec export              # decrypt .sec → stdout
-dotsec export -o .env      # decrypt .sec → .env file
+export DOTSEC_PRIVATE_KEY="AGE-SECRET-KEY-1..."
 ```
 
-### `dotsec show`
+## AWS KMS
 
-Display decrypted `.sec` contents in various formats:
+For teams needing IAM-controlled access and CloudTrail audit logs:
 
 ```bash
-dotsec show                           # raw key=value (default)
-dotsec show --output-format json      # JSON object
-dotsec show --output-format csv       # CSV format
-dotsec show --output-format text      # formatted text
+dotsec init   # choose "aws", enter KMS key ID and region
 ```
 
-### `dotsec run`
+## Project structure
 
-Decrypt `.sec` in memory, resolve `${VAR}` interpolation, inject env vars into a child process. Encrypted values are automatically redacted from stdout/stderr.
-
-```bash
-dotsec run -- node server.js
-dotsec run --using env -- cargo test    # use .env instead of .sec
 ```
-
-The child process runs in a pseudo-terminal (PTY), so colors, interactive output, and `isatty()` detection work automatically.
-
-### `dotsec validate`
-
-Check directives and values against type constraints:
-
-```bash
-dotsec validate                          # decrypt .sec and validate
-dotsec validate --sec-file .sec.staging  # validate a specific .sec file
-```
-
-Validates: unknown directives, type mismatches (number, boolean, enum membership), missing directive values, schema constraints, and shell environment overrides.
-
-### `dotsec diff`
-
-Compare environment files for structural differences:
-
-```bash
-dotsec diff .sec.staging .sec.production
-dotsec diff .sec.staging --values              # include value diffs
-```
-
-Reports: missing keys, extra keys, directive mismatches, ordering differences, and optionally value differences.
-
-## Directives
-
-Directives are comments that control encryption, typing, and push targets:
-
-```bash
-# @provider=aws @key-id=alias/dotsec @region=us-east-1 @default-encrypt
-
-# @encrypt
-# @type=string
-# @push=aws-ssm(path="/myapp/prod/db-url")
-DATABASE_URL="postgres://user:pass@localhost:5432/mydb"
-
-# @plaintext
-# @type=enum("development", "preview", "production")
-NODE_ENV="production"
-
-# @plaintext
-# @type=number
-PORT=3000
-```
-
-### Available directives
-
-| Directive | Value | Description |
-|-----------|-------|-------------|
-| `@provider` | `aws` | Encryption provider (file-level) |
-| `@key-id` | KMS key ID or alias | KMS key to use (file-level) |
-| `@region` | AWS region | AWS region (file-level) |
-| `@default-encrypt` | none | Encrypt all variables by default (file-level) |
-| `@default-plaintext` | none | Don't encrypt by default (file-level) |
-| `@encrypt` | none | Mark variable for encryption |
-| `@plaintext` | none | Exclude from encryption (overrides file-level default) |
-| `@type` | `string`, `number`, `boolean`, `enum("a", "b")` | Type validation |
-| `@push` | `aws-ssm(...)`, `aws-secrets-manager(...)` | Push targets |
-
-File-level directives (`@provider`, `@key-id`, `@region`, `@default-encrypt`/`@default-plaintext`) go at the top of the file. Per-variable `@encrypt`/`@plaintext` always overrides the file-level default.
-
-### Push target syntax
-
-```bash
-# Simple
-# @push=aws-ssm
-
-# With parameters (values must be quoted)
-# @push=aws-ssm(path="/myapp/prod", prefix="/app")
-
-# Multiple targets
-# @push=aws-ssm(path="/myapp/prod"), aws-secrets-manager(path="/myapp/prod/db")
-```
-
-## How encryption works
-
-Each `@encrypt` value is individually encrypted with AES-256-GCM using a local data encryption key (DEK) with key commitment, stored as `ENC[base64(commitment||nonce||ciphertext||tag)]`. The DEK is KMS-wrapped and stored as `__DOTSEC_KEY__`.
-
-1. Parse `.sec`, find entries with `@encrypt` (or file-level `@default-encrypt`)
-2. Generate (or reuse) a DEK via AWS KMS `GenerateDataKey` (AES-256)
-3. For each encrypted value, encrypt it locally with AES-256-GCM using a random nonce
-4. Include a 32-byte HMAC-SHA256 key commitment in each encrypted value
-5. Store the KMS-wrapped DEK as `__DOTSEC_KEY__` at the end of the `.sec` file
-
-Since each value is encrypted independently, changing one secret only affects that line — git diffs stay minimal and merges work naturally.
-
-## Variable interpolation
-
-`${VAR}` references are resolved at runtime by `dotsec run`. Single-quoted values are not interpolated (bash convention).
-
-```bash
-# @type=string
-BASE_URL="https://api.example.com"
-
-# @type=string
-WEBHOOK_URL="${BASE_URL}/webhooks"
-```
-
-## Configuration
-
-All configuration lives in the `.sec` file itself as directives — no external config file needed:
-
-```bash
-# @provider=aws @key-id=alias/dotsec @region=us-east-1 @default-encrypt
-
-DATABASE_URL="postgres://..."
-API_KEY="sk-..."
-```
-
-Use `--sec-file` to specify a different `.sec` file:
-
-```bash
-dotsec --sec-file .sec.production show
+dotsec-core/       Core library (encryption, decryption, interpolation, redaction)
+dotsec/            CLI binary
+  npm/             npm platform packages
+dotsec-napi/       Node.js bindings (published as @dotsec/core)
+  npm/             npm platform packages
+dotenv/            .env/.sec parser (internal)
+crypto/            Shared cryptography + local age encryption (internal)
+aws/               AWS KMS encryption (internal)
 ```
 
 ## npm packages
 
 | Package | Description |
 |---------|-------------|
-| `dotsec` | CLI binary (platform-specific via `optionalDependencies`) |
-| `@dotsec/core` | NAPI-RS native Node.js module for parsing, validating, and formatting |
-| `@dotsec/config` | Drop-in `dotenv/config` replacement — `import '@dotsec/config'` (planned) |
+| `dotsec` | CLI binary |
+| `@dotsec/core` | Native Node.js bindings for parsing, validating, and formatting |
 
-## Release workflow
+## Release channels
 
-Versioning is fully automated using [conventional commits](https://www.conventionalcommits.org/) and [release-plz](https://release-plz.ieni.dev/).
+| Channel | Trigger | Install |
+|---------|---------|---------|
+| `latest` | Release PR merge | `npm install dotsec` |
+| `beta` | Every commit on `main` | `npm install dotsec@beta` |
+| `pr-N` | Every PR commit | `npm install dotsec@pr-42` |
+| crates.io | Release PR merge | `cargo install dotsec` |
 
-### How it works
+---
 
-1. Write code using conventional commit messages (`feat:`, `fix:`, `feat!:`)
-2. Release-plz analyzes commits and determines the next version (patch/minor/major)
-3. Release-plz opens a release PR that bumps `Cargo.toml`
-4. Merge the release PR → publishes to crates.io + creates a GitHub release
-5. GitHub release triggers npm publish → publishes to npm as `latest`
-
-### Distribution channels
-
-| Channel | Trigger | Version | Install |
-|---------|---------|---------|---------|
-| `latest` | Release PR merge | `5.1.0` | `npm install dotsec` |
-| `beta` | Every commit on `main` | `5.1.0-beta.abc1234` | `npm install dotsec@beta` |
-| `pr-N` | Every commit on a PR | `5.1.0-pr-42.abc1234` | `npm install dotsec@pr-42` |
-| crates.io | Release PR merge | `5.1.0` | `cargo install dotsec` |
-
-### Commit message → version bump
-
-| Commit | Bump |
-|--------|------|
-| `fix: handle empty values` | patch (`5.0.0` → `5.0.1`) |
-| `feat: add push command` | minor (`5.0.0` → `5.1.0`) |
-| `feat!: redesign directive syntax` | major (`5.0.0` → `6.0.0`) |
-
-## Roadmap
-
-- **`@dotsec/config`** — drop-in replacement for `dotenv/config` that reads `.sec` and decrypts transparently
-- **Azure Key Vault provider** — envelope encryption using Azure Key Vault Keys API
-- **GCP Cloud KMS provider** — envelope encryption using Google Cloud KMS
-- **PKI provider** — asymmetric encryption using public/private key pairs (no cloud dependency)
+**[Full documentation →](https://jpwesselink.github.io/dotsec-rs)**

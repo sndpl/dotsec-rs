@@ -53,7 +53,6 @@ pub async fn match_args(
     };
 
     let sec_file = default_options.sec_file;
-    let encryption_engine = &default_options.encryption_engine;
     let key = sub.get_one::<String>("key");
     let value = sub.get_one::<String>("value");
     let auto_yes = sub.get_flag("yes");
@@ -69,6 +68,55 @@ pub async fn match_args(
     if key.is_empty() {
         return Err("Variable name cannot be empty".into());
     }
+
+    // Auto-init: if .sec doesn't exist, create it with local provider
+    let resolved_engine;
+    let encryption_engine = if std::path::Path::new(sec_file).exists() {
+        &default_options.encryption_engine
+    } else {
+        // Generate keypair and create .sec
+        let key_file = format!("{}.key", sec_file);
+        if !std::path::Path::new(&key_file).exists() {
+            let (identity, _) = crypto::local::generate_keypair();
+            dotsec::write_sec_file(&key_file, &format!("{}\n", identity))?;
+            eprintln!("{} Created {}", "✓".green(), key_file);
+
+            let gitignore_path = std::path::Path::new(sec_file)
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join(".gitignore");
+            let has_key_pattern = std::fs::read_to_string(&gitignore_path)
+                .map(|c| c.lines().any(|l| l.trim() == "*.key" || l.contains(".key")))
+                .unwrap_or(false);
+            if !has_key_pattern {
+                eprintln!("{} Add *.key to .gitignore to avoid committing private keys", "⚠".yellow().bold());
+            }
+        }
+
+        // Write initial .sec with header + local provider config
+        let mut init_lines = dotsec::generate_header();
+        init_lines.push(dotenv::Line::Newline);
+        init_lines.extend(helpers::build_config_directives(
+            &dotenv::FileConfig {
+                provider: Some("local".to_string()),
+                key_id: None,
+                region: None,
+                default_encrypt: Some(true),
+            },
+            true,
+        ));
+        init_lines.push(dotenv::Line::Newline);
+        let output = dotenv::lines_to_string(&init_lines);
+        dotsec::write_sec_file(sec_file, &output)?;
+        eprintln!("{} Created {}", "✓".green(), sec_file);
+        eprintln!("  → Commit {} to git", sec_file);
+        eprintln!("  → Keep {}.key secret — share it with teammates over a secure channel", sec_file);
+
+        resolved_engine = dotsec::EncryptionEngine::Local(dotsec::LocalEncryptionOptions {
+            key_file: None,
+        });
+        &resolved_engine
+    };
 
     // Discover schema
     let schema_path = dotenv::schema::discover_schema(

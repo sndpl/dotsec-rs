@@ -1,7 +1,7 @@
 {
   "name": "dotsec",
   "version": "5.0.0",
-  "description": "Encrypt and manage environment variables with AWS KMS",
+  "description": "Encrypt your .env into a .sec file — committed to git, decrypted at runtime",
   "bin": {
     "dotsec": "bin/dotsec.js"
   },
@@ -26,7 +26,7 @@
     "type": "git",
     "url": "https://github.com/jpwesselink/dotsec-rs.git"
   },
-  "homepage": "https://github.com/jpwesselink/dotsec-rs",
+  "homepage": "https://jpwesselink.github.io/dotsec-rs",
   "bugs": {
     "url": "https://github.com/jpwesselink/dotsec-rs/issues"
   },

@@ -48,7 +48,7 @@ pub async fn match_args(
     // Extract region from encryption engine
     let region = match encryption_engine {
         dotsec::EncryptionEngine::Aws(opts) => opts.region.as_deref(),
-        dotsec::EncryptionEngine::None => None,
+        dotsec::EncryptionEngine::Local(_) | dotsec::EncryptionEngine::None => None,
     };
 
     // Decrypt .sec
